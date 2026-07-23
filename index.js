@@ -41,7 +41,7 @@ app.use(
 );
 
 // Explicitly handle Preflight requests (FIXED: Express 5 syntax)
-app.options("(.*)", cors());
+app.options("/*splat", cors());
 
 app.use(express.json({ limit: "2mb" }));
 
@@ -429,8 +429,8 @@ app.get("/api/admin/learners/:id", auth, adminOnly, asyncHandler(async (req, res
   res.json({ user: publicUser(learner), ...progress });
 }));
 
-// Catch-all Unmatched Routes Handler (FIXED: Express 5 regex syntax)
-app.use("(.*)", (_req, res) => {
+// Catch-all Unmatched Routes Handler
+app.use((_req, res) => {
   res.status(404).json({ message: "Route not found" });
 });
 
