@@ -40,8 +40,8 @@ app.use(
   })
 );
 
-// Explicitly handle Preflight requests
-app.options("*", cors());
+// Explicitly handle Preflight requests (FIXED: Express 5 syntax)
+app.options("(.*)", cors());
 
 app.use(express.json({ limit: "2mb" }));
 
@@ -428,6 +428,11 @@ app.get("/api/admin/learners/:id", auth, adminOnly, asyncHandler(async (req, res
   const progress = await buildProgressForUser(learner._id, 180);
   res.json({ user: publicUser(learner), ...progress });
 }));
+
+// Catch-all Unmatched Routes Handler (FIXED: Express 5 regex syntax)
+app.use("(.*)", (_req, res) => {
+  res.status(404).json({ message: "Route not found" });
+});
 
 // Global Error Handler
 app.use((error, _req, res, _next) => {
