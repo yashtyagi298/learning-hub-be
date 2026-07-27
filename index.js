@@ -59,7 +59,7 @@ async function connectToDatabase() {
   const db = await mongoose.connect(mongoUri, {
     bufferCommands: false, // Serverless latency issues se bachata hai
   });
-  
+
   cachedDb = db;
   await seedAdmin();
   return db;
@@ -125,6 +125,10 @@ const quizAttemptSchema = new mongoose.Schema(
   {
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     quizType: { type: String, default: "subnetting" },
+    // For the per-question flow, each attempt is a single question:
+    // score is 0 or 1, total is 1. Older full-sheet attempts (score/total
+    // out of the full sheet) are still supported and handled correctly
+    // by the aggregate accuracy calculation below.
     score: Number,
     total: Number,
     answers: Object
@@ -149,11 +153,50 @@ function dayKey(date) {
   return new Date(new Date(date).getTime() + indiaOffsetMs).toISOString().slice(0, 10);
 }
 
-function calculateStreak(journals) {
-  const activeDays = new Set(journals.map((journal) => dayKey(journal.createdAt)));
+/**
+ * Merge journal entries and quiz attempts into one activity-per-day map.
+ * This is the single source of truth for "was the user active on this day",
+ * used by streak, heatmap, and updatedToday so that submitting even a
+ * single subnetting question counts as activity for that day.
+ */
+function combineActivityByDay(journals, attempts) {
+  const map = new Map();
+
+  const ensure = (key) => {
+    if (!map.has(key)) {
+      map.set(key, {
+        hours: 0,
+        journalEntries: [],
+        attemptsCount: 0,
+        correctCount: 0,
+        totalQuestions: 0
+      });
+    }
+    return map.get(key);
+  };
+
+  for (const journal of journals) {
+    const key = dayKey(journal.createdAt);
+    const bucket = ensure(key);
+    bucket.hours += journal.hours ?? 0;
+    bucket.journalEntries.push(journal);
+  }
+
+  for (const attempt of attempts) {
+    const key = dayKey(attempt.createdAt);
+    const bucket = ensure(key);
+    bucket.attemptsCount += 1;
+    bucket.correctCount += attempt.score ?? 0;
+    bucket.totalQuestions += attempt.total ?? 0;
+  }
+
+  return map;
+}
+
+function calculateStreak(activityMap) {
   let streak = 0;
   const cursor = startOfDay();
-  while (activeDays.has(dayKey(cursor))) {
+  while (activityMap.has(dayKey(cursor))) {
     streak += 1;
     cursor.setDate(cursor.getDate() - 1);
   }
@@ -179,43 +222,63 @@ function buildWeeklyStudy(journals) {
   return days.map(({ key, ...item }) => item);
 }
 
-function buildHeatmap(journals) {
-  const journalMap = new Map();
-  for (const journal of journals) {
-    const key = dayKey(journal.createdAt);
-    const current = journalMap.get(key) ?? { hours: 0, entries: [] };
-    current.hours += journal.hours ?? 0;
-    current.entries.push(journal);
-    journalMap.set(key, current);
-  }
-
+/**
+ * Heatmap intensity now blends journal study hours with subnetting
+ * quiz activity, so answering questions lights up the calendar even
+ * on a day with no journal entry. Each ~20 questions answered counts
+ * roughly like an extra "study hour" for intensity purposes.
+ */
+function buildHeatmap(activityMap) {
   return Array.from({ length: 98 }, (_, index) => {
     const date = startOfDay();
     date.setDate(date.getDate() - (97 - index));
     const key = dayKey(date);
-    const entry = journalMap.get(key);
-    const minutes = Math.round((entry?.hours ?? 0) * 60);
+    const entry = activityMap.get(key);
+
+    const hours = entry?.hours ?? 0;
+    const attemptsCount = entry?.attemptsCount ?? 0;
+    const correctCount = entry?.correctCount ?? 0;
+    const totalQuestions = entry?.totalQuestions ?? 0;
+    const activityScore = hours + attemptsCount * 0.05;
+    const minutes = Math.round(hours * 60);
+
+    const journalTopic = entry?.journalEntries?.[0]?.topics;
+    const journalNote = entry?.journalEntries?.[0]?.todayStudy;
+
+    const title =
+      journalTopic ||
+      (attemptsCount ? "Subnetting practice" : "No study recorded");
+
+    const detail =
+      journalNote ||
+      (attemptsCount
+        ? `${attemptsCount} subnetting question${attemptsCount === 1 ? "" : "s"} attempted (${correctCount}/${totalQuestions} correct).`
+        : "No journal saved for this day.");
+
     return {
       date: key,
-      intensity: Math.min(4, Math.ceil((entry?.hours ?? 0) / 1.5)),
-      title: entry?.entries?.[0]?.topics || "No study recorded",
-      detail: entry?.entries?.[0]?.todayStudy || "No journal saved for this day.",
-      minutes
+      intensity: Math.min(4, Math.ceil(activityScore / 1.5)),
+      title,
+      detail,
+      minutes,
+      attemptsCount
     };
   });
 }
 
-function calculateAchievements({ journals, tasks, attempts, bestSubnetting, streak }) {
+function calculateAchievements({ journals, tasks, bestSubnetting, streak, activityMap }) {
   const completedTasks = tasks.filter((task) => task.status === "completed").length;
   const journalDays = new Set(journals.map((journal) => dayKey(journal.createdAt))).size;
+  const quizActiveDays = Array.from(activityMap.values()).filter((day) => day.attemptsCount > 0).length;
+
   const achievementList = [
     { id: "first-journal", title: "First Journal", description: "Saved your first daily report.", progress: journals.length ? 100 : 0 },
     { id: "daily-reporter", title: "Daily Reporter", description: "Saved reports on 7 different days.", progress: Math.min(100, Math.round((journalDays / 7) * 100)) },
     { id: "seven-day-streak", title: "7 Day Streak", description: "Updated progress for 7 days in a row.", progress: Math.min(100, Math.round((streak / 7) * 100)) },
     { id: "task-finisher", title: "Task Finisher", description: "Completed 10 study tasks.", progress: Math.min(100, Math.round((completedTasks / 10) * 100)) },
-    { id: "subnetting-80", title: "Subnetting 80+", description: "Score 80 or more on subnetting MCQ sheet.", progress: Math.min(100, bestSubnetting) },
-    { id: "subnetting-master", title: "Subnetting Master", description: "Score 95 or more on subnetting MCQ sheet.", progress: Math.min(100, Math.round((bestSubnetting / 95) * 100)) },
-    { id: "quiz-consistency", title: "Quiz Consistency", description: "Submit 5 subnetting attempts.", progress: Math.min(100, Math.round((attempts.length / 5) * 100)) }
+    { id: "subnetting-80", title: "Subnetting 80+", description: "Score 80% or higher accuracy across your subnetting attempts.", progress: Math.min(100, bestSubnetting) },
+    { id: "subnetting-master", title: "Subnetting Master", description: "Score 95% or higher accuracy across your subnetting attempts.", progress: Math.min(100, Math.round((bestSubnetting / 95) * 100)) },
+    { id: "quiz-consistency", title: "Quiz Consistency", description: "Attempt subnetting questions on 5 different days.", progress: Math.min(100, Math.round((quizActiveDays / 5) * 100)) }
   ];
 
   return achievementList.map((achievement) => ({ ...achievement, unlocked: achievement.progress >= 100 }));
@@ -243,13 +306,25 @@ async function buildProgressForUser(userId, journalLimit = 90) {
     QuizAttempt.find({ userId, quizType: "subnetting" }).sort({ createdAt: -1 })
   ]);
 
-  const bestSubnetting = attempts.reduce((best, item) => Math.max(best, item.score ?? 0), 0);
+  // Aggregate accuracy across ALL saved attempts (works whether each
+  // attempt is a single question with total: 1, or an older full-sheet
+  // attempt with total: 375 / 100). This replaces the old "max single
+  // attempt score" logic, which broke once attempts became per-question.
+  const totalQuestionsAttempted = attempts.reduce((sum, item) => sum + (item.total ?? 0), 0);
+  const totalCorrectAnswers = attempts.reduce((sum, item) => sum + (item.score ?? 0), 0);
+  const bestSubnetting = totalQuestionsAttempted
+    ? Math.round((totalCorrectAnswers / totalQuestionsAttempted) * 100)
+    : 0;
+
   const hoursStudied = journals.reduce((total, item) => total + (item.hours ?? 0), 0);
   const completedTasks = tasks.filter((task) => task.status === "completed").length;
-  const streak = calculateStreak(journals);
+
+  const activityMap = combineActivityByDay(journals, attempts);
+  const streak = calculateStreak(activityMap);
   const weeklyStudy = buildWeeklyStudy(journals);
-  const heatmap = buildHeatmap(journals);
-  const achievements = calculateAchievements({ journals, tasks, attempts, bestSubnetting, streak });
+  const heatmap = buildHeatmap(activityMap);
+  const updatedToday = activityMap.has(dayKey(new Date()));
+  const achievements = calculateAchievements({ journals, tasks, bestSubnetting, streak, activityMap });
   const topicProgress = buildTopicProgress(journals);
 
   return {
@@ -258,11 +333,13 @@ async function buildProgressForUser(userId, journalLimit = 90) {
       completedTasks,
       totalTasks: tasks.length,
       bestSubnetting,
+      totalQuestionsAttempted,
+      totalCorrectAnswers,
       attempts: attempts.length,
       journalCount: journals.length,
       streak,
       lastUpdated: journals[0]?.createdAt ?? attempts[0]?.createdAt ?? tasks[0]?.updatedAt ?? null,
-      updatedToday: journals.some((journal) => dayKey(journal.createdAt) === dayKey(new Date()))
+      updatedToday
     },
     weeklyStudy,
     heatmap,
@@ -382,7 +459,16 @@ app.patch("/api/tasks/:id", auth, asyncHandler(async (req, res) => {
 }));
 
 app.post("/api/quiz/subnetting-attempts", auth, asyncHandler(async (req, res) => {
-  const attempt = await QuizAttempt.create({ userId: req.user.id, quizType: "subnetting", score: req.body.score, total: req.body.total ?? 100, answers: req.body.answers ?? {} });
+  // total defaults to 1 because the quiz sheet now submits one question
+  // at a time (score: 0 or 1, total: 1). Older bulk submissions that
+  // pass their own total still work exactly the same.
+  const attempt = await QuizAttempt.create({
+    userId: req.user.id,
+    quizType: "subnetting",
+    score: req.body.score,
+    total: req.body.total ?? 1,
+    answers: req.body.answers ?? {}
+  });
   res.status(201).json(attempt);
 }));
 
